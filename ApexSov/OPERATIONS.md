@@ -8,6 +8,8 @@ This document covers:
 
 Scope note: the append-only audit ledger is stored in Redis under `apex:audit_ledger`. Retention policies in this service apply only to **non-ledger** Redis state (e.g., session prompts, content store); the ledger itself is intended to be immutable and never deleted.
 
+For local-only deployments, see `OFFLINE_QUICKSTART.md` and run `py -3 verify_chimera.py` before startup.
+
 ---
 
 ## 1) Backup / Restore Procedures
