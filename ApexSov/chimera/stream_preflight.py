@@ -34,6 +34,9 @@ async def run_stream_preflight(
     get_tool_scoping_fn: Any,
     filter_tools_for_policy_fn: Any,
     default_policy_tool_scoping: Dict[str, Any],
+    sanitize_messages_fn: Any,
+    safety_guard: Any,
+    classify_failure_fn: Any,
 ) -> Dict[str, Any]:
     audit_ctx: Dict[str, Any] = {}
     if http_request is not None:
@@ -51,6 +54,15 @@ async def run_stream_preflight(
         seed_policy=seed_policy_for_group_fn("default"),
     )
     policy = policy_record.policy
+
+    sanitized_messages, sanitize_meta = sanitize_messages_fn(
+        request_obj.messages,
+        guard=safety_guard,
+        pii_patterns=list(policy.get("pii_patterns") or []),
+    )
+    request_obj.messages = sanitized_messages
+    if int(sanitize_meta.get("messages_sanitized") or 0) > 0:
+        audit_ctx["input_sanitizer"] = sanitize_meta
 
     allow_multimodal = bool(policy.get("allow_multimodal", False))
     is_text_only, reason = validate_text_only_messages_fn(request_obj.messages)
@@ -71,6 +83,7 @@ async def run_stream_preflight(
             **audit_ctx,
             "region": apex_region,
             "ledger_chain_id": apex_chain_id,
+            "failure": classify_failure_fn(ValueError("unsupported_non_text_content")),
         }
         try:
             await create_unsigned_ledger_entry_fn(r, audit_payload)
@@ -101,6 +114,7 @@ async def run_stream_preflight(
             **audit_ctx,
             "region": apex_region,
             "ledger_chain_id": apex_chain_id,
+            "failure": classify_failure_fn(PermissionError("model_not_allowlisted")),
         }
         try:
             await create_unsigned_ledger_entry_fn(r, audit_payload)
@@ -113,7 +127,40 @@ async def run_stream_preflight(
 
     authz_result = await authz_engine.check(identity, requested_model=requested_internal_model)
     if authz_result.decision != authorization_decision_allow:
-        raise HTTPException(status_code=403, detail=f"Access denied: {authz_result.reason}")
+        authz_failure = classify_failure_fn(PermissionError(f"authorization_denied:{authz_result.reason}"))
+        audit_payload = {
+            "ts": utc_now_z_fn(),
+            "tenant_id": tenant_id,
+            "session_id": session_id,
+            "policy_version": policy_version,
+            "decision": "DENY",
+            "violation": "authorization_denied",
+            "score": 1.0,
+            "reason": authz_result.reason,
+            "model": requested_internal_model,
+            "requested_model": request_obj.model,
+            "model_params": model_params,
+            "subject": identity.subject,
+            "roles": identity.roles,
+            "failure": authz_failure,
+            **audit_ctx,
+            "region": apex_region,
+            "ledger_chain_id": apex_chain_id,
+        }
+        try:
+            await create_unsigned_ledger_entry_fn(r, audit_payload)
+            await record_metrics_for_audit_fn(r, audit_payload)
+        except ledger_backpressure_error_cls:
+            pass
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": f"Access denied: {authz_result.reason}",
+                "failure": authz_failure,
+            },
+        )
 
     internal_model = authz_result.effective_model or requested_internal_model
 
@@ -142,6 +189,7 @@ async def run_stream_preflight(
             **audit_ctx,
             "region": apex_region,
             "ledger_chain_id": apex_chain_id,
+            "failure": classify_failure_fn(PermissionError("tool_scope_denied")),
         }
         try:
             await create_unsigned_ledger_entry_fn(r, audit_payload)

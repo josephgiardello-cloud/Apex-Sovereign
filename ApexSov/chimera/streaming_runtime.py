@@ -52,6 +52,7 @@ async def stream_llm_with_risk(
     reserve_usage_or_raise_fn: Any,
     add_completion_usage_fn: Any,
     estimate_cost_usd_fn: Any,
+    classify_failure_fn: Any,
 ) -> AsyncGenerator[bytes, None]:
     committed_prefix_raw = ""
     committed_prefix_streamed = ""
@@ -387,8 +388,21 @@ async def stream_llm_with_risk(
             if isinstance(last_error, HTTPException):
                 raise last_error
             if last_error is not None:
-                raise HTTPException(status_code=502, detail=f"All upstream providers failed: {last_error}")
-            raise HTTPException(status_code=502, detail="All upstream providers failed")
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "message": f"All upstream providers failed: {last_error}",
+                        "failure": classify_failure_fn(last_error),
+                    },
+                )
+            unknown_error = RuntimeError("All upstream providers failed")
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "All upstream providers failed",
+                    "failure": classify_failure_fn(unknown_error),
+                },
+            )
         except asyncio.CancelledError:
             raise
         finally:

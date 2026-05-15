@@ -133,6 +133,9 @@ chimera_stream_preflight = chimera_import_compat.import_module_compat(__package_
 chimera_policy_tool_scoping = chimera_import_compat.import_module_compat(__package__, ".chimera.policy_tool_scoping", "chimera.policy_tool_scoping")
 chimera_upstream_runtime = chimera_import_compat.import_module_compat(__package__, ".chimera.upstream_runtime", "chimera.upstream_runtime")
 chimera_usage_runtime = chimera_import_compat.import_module_compat(__package__, ".chimera.usage_runtime", "chimera.usage_runtime")
+chimera_idempotency_runtime = chimera_import_compat.import_module_compat(__package__, ".chimera.idempotency_runtime", "chimera.idempotency_runtime")
+chimera_input_sanitizer = chimera_import_compat.import_module_compat(__package__, ".chimera.input_sanitizer", "chimera.input_sanitizer")
+chimera_failure_taxonomy = chimera_import_compat.import_module_compat(__package__, ".chimera.failure_taxonomy", "chimera.failure_taxonomy")
 
 ALERT_MIN_TONY_SCORE = apex_config.ALERT_MIN_TONY_SCORE
 ALERT_WEBHOOK_URL = apex_config.ALERT_WEBHOOK_URL
@@ -618,6 +621,32 @@ def redact_pii(text: str, patterns: List[str]) -> str:
     return redacted
 
 
+async def enforce_sovereign_egress_or_raise(
+    r: Optional[redis.Redis],
+    *,
+    tenant_id: Optional[str],
+    session_id: Optional[str],
+    subject: Optional[str],
+    roles: Optional[List[str]],
+    purpose: str,
+    url: str,
+) -> None:
+    allowed, reason, details = egress_check_url(url)
+    if allowed:
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "message": "Sovereign egress policy blocked outbound request",
+            "purpose": purpose,
+            "url": url,
+            "reason": reason,
+            "details": details,
+        },
+    )
+
+
 chimera_drift_runtime.configure_drift_runtime(
     apex_embedding_model=APEX_EMBEDDING_MODEL,
     openai_base_url=apex_config.OPENAI_BASE_URL,
@@ -679,7 +708,6 @@ chimera_siem_ir.configure_siem_ir(
 )
 
 send_alert_if_needed = chimera_siem_ir.send_alert_if_needed
-enforce_sovereign_egress_or_raise = chimera_siem_ir.enforce_sovereign_egress_or_raise
 
 
 # =========================================================
@@ -815,6 +843,10 @@ def _validate_text_only_messages(messages: List[Dict[str, Any]]) -> Tuple[bool, 
 
 app = FastAPI()
 
+IdempotencyBoundary = chimera_idempotency_runtime.IdempotencyBoundary
+IDEMPOTENCY_BOUNDARY = IdempotencyBoundary()
+SAFETY_GUARD = chimera_input_sanitizer.SafetyGuard()
+
 
 async def get_identity(
     authorization: str = Header(alias="Authorization"),
@@ -924,6 +956,39 @@ async def streaming_proxy(
     """
     tenant_id = identity.tenant_id
     session_id = f"{tenant_id}:{x_session_id}"
+    request_id = str(http_request.headers.get("x-request-id") or "").strip() or str(uuid.uuid4())
+
+    loop = asyncio.get_running_loop()
+    idem_state, idem_cached, idem_inflight = IDEMPOTENCY_BOUNDARY.acquire_or_get(
+        session_id=session_id,
+        request_id=request_id,
+        loop=loop,
+    )
+
+    async def _single_payload_stream(payload: Any):
+        if isinstance(payload, bytes):
+            yield payload
+            return
+        yield str(payload or "").encode("utf-8")
+
+    if idem_state == "cached":
+        return StreamingResponse(_single_payload_stream(idem_cached), media_type="text/plain")
+
+    if idem_state == "inflight" and idem_inflight is not None:
+        try:
+            inflight_result = await idem_inflight
+            return StreamingResponse(_single_payload_stream(inflight_result), media_type="text/plain")
+        except Exception as exc:
+            failure = chimera_failure_taxonomy.classify_failure(exc)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": "In-flight duplicate request failed",
+                    "request_id": request_id,
+                    "failure": failure,
+                },
+            )
+
     r = await get_redis_client()
     await _enforce_failsafe_or_raise(r)
     engine = ApexSovereignEngine(r_client=r, drift_backend=DRIFT_BACKEND)
@@ -956,9 +1021,14 @@ async def streaming_proxy(
         get_tool_scoping_fn=chimera_policy_tool_scoping.get_tool_scoping,
         filter_tools_for_policy_fn=chimera_policy_tool_scoping.filter_tools_for_policy,
         default_policy_tool_scoping=DEFAULT_POLICY_TOOL_SCOPING,
+        sanitize_messages_fn=chimera_input_sanitizer.sanitize_messages,
+        safety_guard=SAFETY_GUARD,
+        classify_failure_fn=chimera_failure_taxonomy.classify_failure,
     )
 
     audit_ctx = preflight["audit_ctx"]
+    if not audit_ctx.get("request_id"):
+        audit_ctx["request_id"] = request_id
     model_params = preflight["model_params"]
     policy = preflight["policy"]
     internal_model = preflight["internal_model"]
@@ -966,7 +1036,7 @@ async def streaming_proxy(
     if int(tool_filter.get("provided") or 0) > 0:
         audit_ctx["tool_filter"] = tool_filter
 
-    stream_generator = chimera_streaming_runtime.stream_llm_with_risk(
+    source_stream_generator = chimera_streaming_runtime.stream_llm_with_risk(
         request_obj=request,
         tenant_id=tenant_id,
         session_id=session_id,
@@ -1009,7 +1079,38 @@ async def streaming_proxy(
         reserve_usage_or_raise_fn=chimera_usage_runtime.reserve_usage_or_raise,
         add_completion_usage_fn=chimera_usage_runtime.add_completion_usage,
         estimate_cost_usd_fn=chimera_usage_runtime.estimate_cost_usd,
+        classify_failure_fn=chimera_failure_taxonomy.classify_failure,
     )
+
+    if idem_state == "acquired":
+        async def _idempotent_stream_wrapper():
+            chunks: List[str] = []
+            try:
+                async for chunk in source_stream_generator:
+                    if isinstance(chunk, bytes):
+                        text_chunk = chunk.decode("utf-8", errors="ignore")
+                        chunks.append(text_chunk)
+                        yield chunk
+                    else:
+                        text_chunk = str(chunk or "")
+                        chunks.append(text_chunk)
+                        yield text_chunk.encode("utf-8")
+                IDEMPOTENCY_BOUNDARY.store_result(
+                    session_id=session_id,
+                    request_id=request_id,
+                    result="".join(chunks),
+                )
+            except Exception as exc:
+                IDEMPOTENCY_BOUNDARY.store_error(
+                    session_id=session_id,
+                    request_id=request_id,
+                    error=exc,
+                )
+                raise
+
+        stream_generator = _idempotent_stream_wrapper()
+    else:
+        stream_generator = source_stream_generator
 
     with tracer.start_as_current_span("apex.stream.request") as span:
         span.set_attribute("tenant.id", identity.tenant_id)
@@ -1017,6 +1118,21 @@ async def streaming_proxy(
         span.set_attribute("model.internal", request.model)
         span.set_attribute("auth.subject", identity.subject)
         return StreamingResponse(stream_generator, media_type="text/plain")
+
+
+@app.get("/api/v1/runtime/idempotency")
+async def runtime_idempotency_status(
+    identity: TenantIdentity = Depends(get_identity),
+    max_keys: int = 50,
+    session_id: Optional[str] = None,
+):
+    if "admin" not in list(identity.roles or []):
+        raise HTTPException(status_code=403, detail="Access denied: admin role required")
+    return IDEMPOTENCY_BOUNDARY.snapshot_for_tenant(
+        tenant_id=identity.tenant_id,
+        max_keys=max_keys,
+        session_id_filter=session_id,
+    )
 
 # =========================================================
 # 7d. ADMIN / MANAGEMENT API – GOVERNANCE CONTROL PLANE
