@@ -10,6 +10,22 @@ Apex Sovereign is a FastAPI-based reverse proxy that sits between your users and
 
 It is not a chatbot. It is not an SDK wrapper. It is the **security and compliance plane** for LLM traffic in regulated or enterprise environments.
 
+## Recommended Offline Stack
+
+For the current local-first Apex setup, the recommended baseline is:
+
+- Ollama as the offline inference runtime
+- `qwen2.5:7b` as the local model core
+- `apex-qwen` as the stable Apex-facing Ollama alias
+- Apex Sovereign as the governance/control plane in front of `/v1/chat/completions`
+
+From [ApexSov](ApexSov), the quickest local setup path is:
+
+```powershell
+.\setup_ollama_qwen.ps1
+py -3 run_offline.py --host 127.0.0.1 --port 8000
+```
+
 ---
 
 ## Architecture at a Glance
@@ -68,7 +84,7 @@ Risk is evaluated **incrementally per streaming chunk**, not after the full resp
 
 ### Policy Engine
 - Per-tenant versioned policies stored in Redis
-- Policy templates: `DEFAULT`, `finance`, `healthcare`, `government`
+- Policy templates: `DEFAULT`, `finance`, `healthcare`, `government`, `dadbot`
 - PII mode: `block` (default) or `redact`
 - Tool scoping: allowlist/denylist per-policy for function-calling
 - Compliance mode: enforced TTLs, retention caps, audit hash salting
@@ -288,6 +304,24 @@ docker run -e APEX_ENV=dev -e APEX_REDIS_URL=redis://host.docker.internal:6379 \
   -p 8000:8000 apex-sovereign
 ```
 
+### DadBot-Style Local UI
+
+Run a lightweight DadBot-style Streamlit interface that talks to Sovereign `/v1/stream`:
+
+```bash
+# Start Apex Sovereign first (port 8000)
+python ApexSov/run_offline.py
+
+# In another shell, launch UI
+streamlit run ApexSov/dadbot_sovereign_ui.py
+```
+
+Open `http://localhost:8501`.
+
+Notes:
+- This is an interface layer only; Apex remains the governance/runtime plane.
+- For protected deployments, paste a valid bearer token in the UI sidebar.
+
 ---
 
 ## Quick Start (Production)
@@ -352,6 +386,21 @@ Core principle:
 - Dad-Bot features remain user-facing
 - Apex enforces policy, risk, and cryptographic audit on every turn
 
+### In-Place Upgrade Mode (Recommended)
+
+You do **not** need a brand-new repository.
+
+Use this existing Apex repository as the governance/control plane and connect Dad-Bot as a separate client/runtime that points to this Apex `/v1/stream` endpoint.
+
+Minimal wiring model:
+- Keep Apex in this repo and run it as-is.
+- Keep Dad-Bot in its own repo/worktree.
+- Set Dad-Bot provider to `sovereign` and point it at this Apex base URL.
+- Apply the `dadbot` tenant policy template in Apex.
+- Route all Dad-Bot LLM traffic through Apex.
+
+See `ApexSov/DADBOT_INPLACE_UPGRADE.md` and `ApexSov/.env.dadbot.example` for concrete setup.
+
 ### Target Architecture
 
 ```text
@@ -395,8 +444,8 @@ Keep mostly as-is:
 ### Phased Integration Plan
 
 1. Phase 1 (Foundation, 1-2 weeks)
-- Create unified repo or fork strategy (`Apex-Dad-Sovereign`)
-- Bring in Dad-Bot modules (`submodule` or selective copy)
+- Keep this Apex repo as the control plane (no repo split required)
+- Connect Dad-Bot runtime to Apex `/v1/stream` via a thin client adapter
 - Add `DADBOT` policy template: warm, family-safe, emotionally aware, low hallucination tolerance
 - Extend allowlist/provider pool for local Ollama via `APEX_UPSTREAM_PROVIDERS_JSON`
 - Keep software signer fallback for personal deployments
@@ -425,18 +474,16 @@ Keep mostly as-is:
 - Keep PWA/mobile client pointed at governed backend
 - Optional runtime mode switch: fully local or governed cloud hybrid
 
-### Recommended Unified Project Structure
+### Recommended In-Place Structure
 
 ```text
-Apex-Dad-Sovereign/
-├── ApexSov/                  # Apex Sovereign runtime and governance plane
-├── dadbot/                   # Dad-Bot personality and memory layer (refactored)
-├── sovereign_client/         # New Python SDK wrapper for Apex /v1/stream
-├── frontend/                 # Streamlit/PWA UX layer
-├── config/                   # Merged env presets and Dad policy templates
-├── docker-compose.yml
-├── OPERATIONS.md             # Extended runbooks
-└── docs/DAD_SOVEREIGN_ARCH.md
+Apex-Sovereign/
+├── ApexSov/                      # Apex Sovereign runtime and governance plane
+│   ├── .env.dadbot.example       # DadBot-targeted local env template
+│   └── DADBOT_INPLACE_UPGRADE.md # In-place DadBot integration runbook
+├── README.md
+└── (external) Dad-Bot repository
+  └── points to this Apex instance via /v1/stream
 ```
 
 ### Challenges and Mitigations

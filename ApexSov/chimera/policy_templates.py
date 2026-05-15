@@ -146,6 +146,79 @@ POLICY_TEMPLATE_MAP: Dict[str, Dict[str, Any]] = {
         "retention": DEFAULT_POLICY_RETENTION,
         "data_minimization": DEFAULT_POLICY_DATA_MINIMIZATION,
     },
+    "dadbot": {
+        # DadBot Sovereign: warm, family-safe, emotionally aware
+        # Lower jailbreak threshold to allow empathic/conversational language
+        # Higher PII protection for family/health/financial contexts
+        "unified_thresh": 0.60,
+        "axis_thresholds": {
+            "pii": 0.25,  # More protective on family/personal data
+            "jailbreak": 0.25,  # Lower to allow warm, empathic tone
+            "grooming": 0.35,  # Allow relationship building in conversations
+            "dlp": 0.30,  # Moderate DLP for family financial/health topics
+        },
+        "risk_weights": {
+            "pii": 1.2,  # Emphasize PII protection
+            "jailbreak": 0.7,  # Reduce jailbreak weight to allow emotional tone
+            "grooming": 0.8,
+            "toxicity": 0.6,  # Allow warm/conversational language
+            "drift": 0.4,  # Moderate drift detection for personality stability
+            "dlp": 1.0,
+            "dlp_semantic": 1.0,
+        },
+        "pii_patterns": DEFAULT_POLICY_BASELINE["pii_patterns"] + [
+            # Family-specific patterns
+            r"\b(mom|dad|mother|father|son|daughter|sibling)\s*'?s?\s+(birthday|phone|address|email)\b",
+            r"\b(grandma|grandpa|grandchild)\b",
+        ],
+        "pii_mode": "redact",  # Redact family info rather than blocking
+        "allow_multimodal": False,
+        "usage_quotas": {
+            "requests_per_minute": 60,  # Casual usage
+            "tokens_per_minute": 90000,
+            "tokens_per_day": 1000000,
+            "tokens_per_month": 0,
+        },
+        # DadBot tools: calendar, reminders, storytelling, memory recall
+        "tool_scoping": {
+            "enabled": True,
+            "mode": "allowlist",
+            "allowed_tools": [
+                "get_calendar_events",
+                "add_reminder",
+                "get_family_stories",
+                "recall_memory",
+                "search_heritage",
+                "create_story",
+                "set_mood_context",
+            ],
+            "denied_tools": [
+                "execute_code",
+                "access_banking",
+                "modify_system_settings",
+            ],
+            "audit_allowed": True,
+        },
+        # Family/personal retention: longer for memory continuity
+        "retention": {
+            "session_prompts_ttl_seconds": 365 * 24 * 3600,  # Full year for memory
+            "adversarial_corpus_ttl_seconds": 365 * 24 * 3600,
+            "content_store_ttl_seconds": 365 * 24 * 3600,
+        },
+        "data_minimization": {
+            "no_content_retention": False,
+            "audit_mode": "full",  # Keep full context for memory consistency
+            "include_subject": True,
+            "include_session_id": True,
+            "include_request_context": True,
+        },
+        # DadBot-specific metadata
+        "tone": "warm_empathic",
+        "family_safe": True,
+        "enable_personality": True,
+        "enable_memory": True,
+        "enable_storytelling": True,
+    },
 }
 
 

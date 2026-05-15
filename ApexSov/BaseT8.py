@@ -40,38 +40,21 @@ in a single pass.
 
 import asyncio
 import base64
-import copy
 import hashlib
+import importlib
 import json
 import os
-import sys
-import time
 import uuid
-from datetime import datetime, timedelta, timezone
-from enum import Enum
-from typing import Dict, Optional, List, Tuple, Any, Protocol, Literal, Callable, Pattern, cast
-from urllib.parse import urlparse
-import ipaddress
+from contextlib import asynccontextmanager
+from typing import Dict, Optional, List, Tuple, Any, Pattern, cast
 
-import math
 import re
 import unicodedata
-import ssl
-from collections import Counter
-import random
 
-import numpy as np
 import redis.asyncio as redis
 from fastapi import FastAPI, Header, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse
-from jose import jwt
-from jose.exceptions import JWTError
-import requests
 from pydantic import BaseModel
-
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
 
 try:
     from .chimera import import_compat as chimera_import_compat
@@ -197,6 +180,7 @@ MODEL_PRICES_USD_PER_1K = apex_config.MODEL_PRICES_USD_PER_1K
 OIDC_AUDIENCE = apex_config.OIDC_AUDIENCE
 OIDC_ISSUER = apex_config.OIDC_ISSUER
 OIDC_TENANT_CLAIM = apex_config.OIDC_TENANT_CLAIM
+APEX_DEV_AUTH_BYPASS = apex_config.APEX_DEV_AUTH_BYPASS
 OPENAI_URL = apex_config.OPENAI_URL
 POLICY_VERSION = apex_config.POLICY_VERSION
 QDRANT_API_KEY = apex_config.QDRANT_API_KEY
@@ -209,7 +193,7 @@ ApexEnv = apex_config.ApexEnv
 
 
 def compile_egress_allowlist_patterns() -> List[Pattern[str]]:
-    patterns = cast(Any, apex_config.compile_egress_allowlist_patterns)()
+    patterns = apex_config.compile_egress_allowlist_patterns()
     return [cast(Pattern[str], pattern) for pattern in cast(List[Any], patterns)]
 
 
@@ -252,25 +236,28 @@ def require_vector_backend_api_key_or_raise(*, api_key: str, endpoint_url: str) 
 # =========================================================
 
 try:
-    from opentelemetry import trace
-
-    tracer = trace.get_tracer("sovereign.apex")
+    trace_module = importlib.import_module("opentelemetry.trace")
+    tracer = trace_module.get_tracer("sovereign.apex")
 
     def tracing_available() -> bool:
         return True
 
 except Exception:
-    class _NoOpTracer:
-        def start_as_current_span(self, name: str):
-            return self
-
+    class _NoOpSpan:
         def __enter__(self):
             return self
 
         def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-            pass
+            return None
 
-    tracer = _NoOpTracer()
+        def set_attribute(self, key: str, value: Any) -> None:
+            return None
+
+    class _NoOpTracer:
+        def start_as_current_span(self, name: str):
+            return _NoOpSpan()
+
+    tracer = cast(Any, _NoOpTracer())
 
     def tracing_available() -> bool:
         return False
@@ -677,7 +664,7 @@ RedisBowDriftBackend = chimera_drift_runtime.RedisBowDriftBackend
 VectorDbDriftBackend = chimera_drift_runtime.VectorDbDriftBackend
 
 
-DRIFT_BACKEND: Optional[DriftBackend] = None
+drift_backend_runtime: Optional[DriftBackend] = None
 
 # =========================================================
 # 5b. ALERTING & XAI EXPLANATIONS
@@ -841,7 +828,38 @@ def _validate_text_only_messages(messages: List[Dict[str, Any]]) -> Tuple[bool, 
     return chimera_message_validation.validate_text_only_messages(messages)
 
 
-app = FastAPI()
+@asynccontextmanager
+async def _app_lifespan(_: FastAPI):
+    """
+    Startup hook:
+    - Enforce tracing in PROD
+    - Initialize Redis
+    - Configure drift backend (Redis Bow or Qdrant + embeddings)
+    """
+    global drift_backend_runtime
+    drift_backend_runtime = await chimera_startup_runtime.initialize_runtime_on_startup(
+        get_apex_env_fn=get_apex_env,
+        apex_env_prod=ApexEnv.PROD,
+        tracing_available_fn=tracing_available,
+        periodic_self_test_loop_fn=_periodic_self_test_loop,
+        retention_enforcer_loop_fn=_retention_enforcer_loop,
+        get_redis_client_fn=get_redis_client,
+        apex_drift_backend=APEX_DRIFT_BACKEND,
+        require_vector_backend_api_key_or_raise_fn=require_vector_backend_api_key_or_raise,
+        openai_base_url=apex_config.OPENAI_BASE_URL,
+        openai_embedding_model=APEX_EMBEDDING_MODEL,
+        openai_embedding_provider_cls=OpenAIEmbeddingProvider,
+        qdrant_index_cls=QdrantIndex,
+        vector_db_drift_backend_cls=VectorDbDriftBackend,
+        redis_bow_drift_backend_cls=RedisBowDriftBackend,
+        qdrant_url=QDRANT_URL,
+        qdrant_api_key=QDRANT_API_KEY,
+        qdrant_collection=QDRANT_COLLECTION,
+    )
+    yield
+
+
+app = FastAPI(lifespan=_app_lifespan)
 
 IdempotencyBoundary = chimera_idempotency_runtime.IdempotencyBoundary
 IDEMPOTENCY_BOUNDARY = IdempotencyBoundary()
@@ -849,9 +867,18 @@ SAFETY_GUARD = chimera_input_sanitizer.SafetyGuard()
 
 
 async def get_identity(
-    authorization: str = Header(alias="Authorization"),
+    authorization: str = Header(default="", alias="Authorization"),
     x_tenant_id: str = Header(default=""),
 ) -> TenantIdentity:
+    # In local dev, allow unauthenticated UI sessions when explicitly enabled.
+    if (not authorization) and APEX_DEV_AUTH_BYPASS and get_apex_env() != ApexEnv.PROD:
+        return TenantIdentity(
+            tenant_id=(x_tenant_id or "family-default"),
+            subject="local-dev-user",
+            roles=["admin"],
+            scopes=["*"],
+            raw_token=None,
+        )
     return await idp_verifier.verify(authorization, x_tenant_id)
 
 
@@ -881,36 +908,6 @@ chimera_runtime_status_routes.register_runtime_status_routes(
     unsigned_warn_fraction=UNSIGNED_WARN_FRACTION,
     ledger_backlog_state_label=chimera_control_plane_payloads.ledger_backlog_state_label,
 )
-
-
-@app.on_event("startup")
-async def on_startup():
-    """
-    Startup hook:
-    - Enforce tracing in PROD
-    - Initialize Redis
-    - Configure drift backend (Redis Bow or Qdrant + embeddings)
-    """
-    global DRIFT_BACKEND
-    DRIFT_BACKEND = await chimera_startup_runtime.initialize_runtime_on_startup(
-        get_apex_env_fn=get_apex_env,
-        apex_env_prod=ApexEnv.PROD,
-        tracing_available_fn=tracing_available,
-        periodic_self_test_loop_fn=_periodic_self_test_loop,
-        retention_enforcer_loop_fn=_retention_enforcer_loop,
-        get_redis_client_fn=get_redis_client,
-        apex_drift_backend=APEX_DRIFT_BACKEND,
-        require_vector_backend_api_key_or_raise_fn=require_vector_backend_api_key_or_raise,
-        openai_base_url=apex_config.OPENAI_BASE_URL,
-        openai_embedding_model=APEX_EMBEDDING_MODEL,
-        openai_embedding_provider_cls=OpenAIEmbeddingProvider,
-        qdrant_index_cls=QdrantIndex,
-        vector_db_drift_backend_cls=VectorDbDriftBackend,
-        redis_bow_drift_backend_cls=RedisBowDriftBackend,
-        qdrant_url=QDRANT_URL,
-        qdrant_api_key=QDRANT_API_KEY,
-        qdrant_collection=QDRANT_COLLECTION,
-    )
 
 
 STREAM_WINDOW = 128
@@ -991,7 +988,7 @@ async def streaming_proxy(
 
     r = await get_redis_client()
     await _enforce_failsafe_or_raise(r)
-    engine = ApexSovereignEngine(r_client=r, drift_backend=DRIFT_BACKEND)
+    engine = ApexSovereignEngine(r_client=r, drift_backend=drift_backend_runtime)
 
     preflight = await chimera_stream_preflight.run_stream_preflight(
         request_obj=request,
@@ -1032,8 +1029,13 @@ async def streaming_proxy(
     model_params = preflight["model_params"]
     policy = preflight["policy"]
     internal_model = preflight["internal_model"]
-    tool_filter = preflight.get("tool_filter") or {}
-    if int(tool_filter.get("provided") or 0) > 0:
+    tool_filter = cast(Dict[str, Any], preflight.get("tool_filter") or {})
+    provided_raw = tool_filter.get("provided", 0)
+    try:
+        provided_count = int(provided_raw)
+    except Exception:
+        provided_count = 0
+    if provided_count > 0:
         audit_ctx["tool_filter"] = tool_filter
 
     source_stream_generator = chimera_streaming_runtime.stream_llm_with_risk(
@@ -1101,12 +1103,23 @@ async def streaming_proxy(
                     result="".join(chunks),
                 )
             except Exception as exc:
-                IDEMPOTENCY_BOUNDARY.store_error(
+                failure = chimera_failure_taxonomy.classify_failure(exc)
+                error_payload = json.dumps(
+                    {
+                        "error": {
+                            "message": "stream_processing_failed",
+                            "failure": failure,
+                        }
+                    },
+                    separators=(",", ":"),
+                )
+                IDEMPOTENCY_BOUNDARY.store_result(
                     session_id=session_id,
                     request_id=request_id,
-                    error=exc,
+                    result=error_payload,
                 )
-                raise
+                yield error_payload.encode("utf-8")
+                return
 
         stream_generator = _idempotent_stream_wrapper()
     else:
@@ -1209,7 +1222,7 @@ chimera_control_plane_runtime.register_control_plane_routes(
     redact_env_value=redact_env_value,
     tenant_store_factory=TenantStore,
     drift_engine_factory=ApexSovereignEngine,
-    drift_backend=DRIFT_BACKEND,
+    drift_backend=drift_backend_runtime,
     vector_backend_cls=VectorDbDriftBackend,
     redis_bow_backend_cls=RedisBowDriftBackend,
     get_rtbf_proof_payload=chimera_rtbf_proof_views.get_rtbf_proof_payload,

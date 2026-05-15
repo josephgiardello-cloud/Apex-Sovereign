@@ -22,10 +22,17 @@ def parse_upstream_provider_pool(*, providers_json: str, default_url: str) -> Li
                     if not url:
                         continue
                     auth = item.get("auth") if isinstance(item.get("auth"), dict) else {}
+                    raw_model_map = item.get("model_map") if isinstance(item.get("model_map"), dict) else {}
+                    model_map = {
+                        str(k).strip(): str(v).strip()
+                        for k, v in raw_model_map.items()
+                        if str(k).strip() and str(v).strip()
+                    }
                     providers.append(
                         {
                             "name": str(item.get("name") or f"provider-{idx + 1}"),
                             "url": url,
+                            "model_map": model_map,
                             "auth": {
                                 "type": str(auth.get("type") or "bearer").strip().lower(),
                                 "env": str(auth.get("env") or "OPENAI_API_KEY").strip(),

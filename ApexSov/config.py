@@ -12,9 +12,9 @@ import ipaddress
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Pattern, Set, Tuple, cast
 from urllib.parse import urlparse
 
 
@@ -65,6 +65,8 @@ OIDC_ISSUER = os.getenv("APEX_OIDC_ISSUER", "")
 OIDC_AUDIENCE = os.getenv("APEX_OIDC_AUDIENCE", "")
 OIDC_TENANT_CLAIM = os.getenv("APEX_OIDC_TENANT_CLAIM", "tid")
 JWKS_CACHE_TTL_SECONDS = int(os.getenv("APEX_JWKS_CACHE_TTL_SECONDS", "300"))
+# Local dev bypass for UI/prototyping. Never effective in PROD.
+APEX_DEV_AUTH_BYPASS = os.getenv("APEX_DEV_AUTH_BYPASS", "true").lower() == "true"
 
 # Ledger checkpointing
 LEDGER_CHAIN_ID = os.getenv("APEX_LEDGER_CHAIN_ID", "apex-audit-ledger")
@@ -161,7 +163,7 @@ def is_sensitive_env_key(name: str) -> bool:
 
 
 def redact_env_value(name: str, value: str) -> Dict[str, Any]:
-    v = value if isinstance(value, str) else str(value)
+    v = value
     return {
         "redacted": True,
         "sha256": hashlib.sha256(v.encode("utf-8")).hexdigest(),
@@ -196,7 +198,7 @@ def collect_env_config_snapshot() -> Dict[str, Any]:
         if is_sensitive_env_key(k):
             redacted_vars[k] = redact_env_value(k, v)
         else:
-            sv = v if isinstance(v, str) else str(v)
+            sv = v
             if len(sv) > 512:
                 redacted_vars[k] = {
                     "redacted": True,
@@ -206,8 +208,8 @@ def collect_env_config_snapshot() -> Dict[str, Any]:
             else:
                 redacted_vars[k] = {"redacted": False, "value": sv}
 
-    snapshot = {
-        "ts": datetime.utcnow().isoformat() + "Z",
+    snapshot: Dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "env": get_apex_env().value,
         "region": APEX_REGION,
         "chain_id": APEX_CHAIN_ID,
@@ -220,11 +222,14 @@ def collect_env_config_snapshot() -> Dict[str, Any]:
     return snapshot
 
 
-ENV_CONFIG_SNAPSHOT: Dict[str, Any] = {}
-try:
-    ENV_CONFIG_SNAPSHOT = collect_env_config_snapshot()
-except Exception:
-    ENV_CONFIG_SNAPSHOT = {}
+def _load_env_config_snapshot() -> Dict[str, Any]:
+    try:
+        return collect_env_config_snapshot()
+    except Exception:
+        return {}
+
+
+ENV_CONFIG_SNAPSHOT: Dict[str, Any] = _load_env_config_snapshot()
 
 
 def _load_upstream_providers_for_validation() -> List[str]:
@@ -235,9 +240,11 @@ def _load_upstream_providers_for_validation() -> List[str]:
         try:
             obj = json.loads(raw)
             if isinstance(obj, list):
-                for it in obj:
-                    if isinstance(it, dict):
-                        u = it.get("url")
+                items = cast(List[Any], obj)
+                for it in items:
+                    item = cast(Optional[Dict[str, Any]], it if isinstance(it, dict) else None)
+                    if item is not None:
+                        u = item.get("url")
                         if isinstance(u, str) and u.strip():
                             urls.append(u.strip())
         except Exception:
@@ -245,7 +252,7 @@ def _load_upstream_providers_for_validation() -> List[str]:
     if not urls:
         urls = [OPENAI_URL]
     out: List[str] = []
-    seen = set()
+    seen: Set[str] = set()
     for u in urls:
         if u not in seen:
             out.append(u)
@@ -266,14 +273,16 @@ def _load_model_prices_usd_per_1k_tokens() -> Dict[str, Dict[str, float]]:
         return {}
     if not isinstance(obj, dict):
         return {}
+    price_map = cast(Dict[str, Any], obj)
     out: Dict[str, Dict[str, float]] = {}
-    for k, v in obj.items():
-        if not isinstance(k, str) or not isinstance(v, dict):
+    for raw_key, raw_value in price_map.items():
+        if not isinstance(raw_value, dict):
             continue
+        value = cast(Dict[str, Any], raw_value)
         try:
-            prompt = float(v.get("prompt") or 0.0)
-            completion = float(v.get("completion") or 0.0)
-            out[k.strip()] = {"prompt": max(0.0, prompt), "completion": max(0.0, completion)}
+            prompt = float(value.get("prompt") or 0.0)
+            completion = float(value.get("completion") or 0.0)
+            out[raw_key.strip()] = {"prompt": max(0.0, prompt), "completion": max(0.0, completion)}
         except Exception:
             continue
     return out
@@ -347,28 +356,28 @@ def validate_no_internet_posture() -> None:
         raise RuntimeError("APEX_NO_INTERNET=true but APEX_SIEM_WEBHOOK_URL appears to be a public endpoint")
 
 
-_EGRESS_ALLOWLIST_CACHE: Optional[List[re.Pattern]] = None
+_egress_allowlist_cache: Optional[List[Pattern[str]]] = None
 
 
-def compile_egress_allowlist_patterns() -> List[re.Pattern]:
-    global _EGRESS_ALLOWLIST_CACHE
-    if _EGRESS_ALLOWLIST_CACHE is not None:
-        return _EGRESS_ALLOWLIST_CACHE
+def compile_egress_allowlist_patterns() -> List[Pattern[str]]:
+    global _egress_allowlist_cache
+    if _egress_allowlist_cache is not None:
+        return _egress_allowlist_cache
 
     raw = (APEX_EGRESS_ALLOWLIST_REGEX or "").strip()
     if not raw:
-        _EGRESS_ALLOWLIST_CACHE = []
-        return _EGRESS_ALLOWLIST_CACHE
+        _egress_allowlist_cache = []
+        return _egress_allowlist_cache
 
     parts = [p.strip() for p in raw.split(",") if p.strip()]
-    compiled: List[re.Pattern] = []
+    compiled: List[Pattern[str]] = []
     for p in parts:
         try:
             compiled.append(re.compile(p))
         except re.error:
             raise RuntimeError("Invalid regex in APEX_EGRESS_ALLOWLIST_REGEX")
 
-    _EGRESS_ALLOWLIST_CACHE = compiled
+    _egress_allowlist_cache = compiled
     return compiled
 
 
@@ -396,7 +405,7 @@ def egress_check_url(url: str) -> Tuple[bool, str, Dict[str, Any]]:
     hostname = parsed.hostname
     port = parsed.port
 
-    details = {
+    details: Dict[str, Any] = {
         "scheme": scheme,
         "host": hostname,
         "port": port,

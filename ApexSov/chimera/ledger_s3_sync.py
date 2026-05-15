@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import boto3
@@ -84,7 +84,7 @@ async def s3_ledger_sync_loop(stop_event: asyncio.Event) -> None:
 
             if should_flush:
                 region = _apex_region
-                date_str = datetime.utcnow().strftime("%Y-%m-%d")
+                date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 prefix = _ledger_s3_prefix.rstrip("/") or "ledger"
                 s3_key = f"{prefix}/{region}/{date_str}/audit.jsonl"
 

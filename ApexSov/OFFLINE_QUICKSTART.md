@@ -11,8 +11,11 @@ Example with Ollama:
 
 ```powershell
 ollama serve
-ollama pull gpt-4o-mini
+.
+\setup_ollama_qwen.ps1
 ```
+
+This pulls `qwen2.5:7b`, creates the stable `apex-qwen` alias, and lists the resulting local models.
 
 ## 2) Configure offline profile
 
@@ -23,6 +26,7 @@ Required keys:
 
 - `APEX_REDIS_URL`
 - `APEX_OPENAI_URL`
+- `APEX_UPSTREAM_PROVIDERS_JSON`
 - `APEX_DRIFT_BACKEND` (`redis` is easiest local mode)
 - `APEX_NO_INTERNET=true`
 
@@ -98,4 +102,5 @@ py -3 preflight_offline.py --check-apex --apex-url http://127.0.0.1:8000
 
 - Public upstream endpoints still require `OPENAI_API_KEY`.
 - Local endpoints can run without an API key.
+- Recommended local model id for Apex clients/UI: `apex-qwen`
 - If you enable vector drift with Qdrant, set `APEX_DRIFT_BACKEND=vector` and configure Qdrant env vars.

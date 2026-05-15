@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
 
 import redis.asyncio as redis
@@ -63,7 +63,7 @@ async def get_24h_risk_stats(
     metrics_highrisk_key: Callable[[str], str],
     metrics_axis_hash_key: Callable[[str], str],
 ) -> Dict[str, Any]:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     total = 0
     blocked = 0
     high_risk_alerts = 0

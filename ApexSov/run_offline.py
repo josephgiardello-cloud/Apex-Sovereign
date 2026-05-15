@@ -7,6 +7,7 @@ OpenAI-compatible local model server such as Ollama.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -39,9 +40,26 @@ def _load_env_file(path: Path) -> Dict[str, str]:
 def _apply_local_defaults() -> None:
     os.environ.setdefault("APEX_ENV", "dev")
     os.environ.setdefault("APEX_REDIS_URL", "redis://127.0.0.1:6379/0")
-    os.environ.setdefault("APEX_OPENAI_URL", "http://127.0.0.1:11434/v1/chat/completions")
+    os.environ["APEX_OPENAI_URL"] = "http://localhost:11434/v1/chat/completions"
+    os.environ["APEX_UPSTREAM_PROVIDERS_JSON"] = json.dumps(
+        [
+            {
+                "name": "ollama-local",
+                "type": "ollama",
+                "url": "http://localhost:11434/v1/chat/completions",
+                "model_map": {
+                    "apex-qwen": "apex-qwen",
+                    "gpt-4o-mini": "apex-qwen",
+                    "gpt-4o": "apex-qwen",
+                },
+                "auth": {"type": "none"},
+            }
+        ]
+    )
     os.environ.setdefault("APEX_DRIFT_BACKEND", "redis")
-    os.environ.setdefault("APEX_NO_INTERNET", "true")
+    os.environ["APEX_NO_INTERNET"] = "true"
+    os.environ["APEX_EGRESS_BLOCK_IP_LITERALS"] = "false"
+    os.environ["APEX_EGRESS_ALLOWLIST_REGEX"] = r"^(localhost|127\.0\.0\.1)$"
     os.environ.setdefault("OPENAI_API_KEY", "")
 
 

@@ -52,8 +52,9 @@ async def get_redis_client() -> redis.Redis:
         return _GLOBAL_REDIS_CLIENT
 
     url = build_redis_url()
-    use_ssl = url.startswith("rediss://")
-    _GLOBAL_REDIS_CLIENT = redis.from_url(url, decode_responses=True, ssl=use_ssl)
+    # redis.from_url already infers TLS from scheme (rediss://). Passing ssl kwarg
+    # can break on some redis-py versions where asyncio connection kwargs differ.
+    _GLOBAL_REDIS_CLIENT = redis.from_url(url, decode_responses=True)
     return _GLOBAL_REDIS_CLIENT
 
 

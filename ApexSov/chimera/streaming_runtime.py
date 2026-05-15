@@ -137,6 +137,14 @@ async def stream_llm_with_risk(
             for provider in provider_order:
                 provider_name = str(provider.get("name") or "upstream")
                 provider_url = str(provider.get("url") or openai_url)
+                provider_auth = provider.get("auth") if isinstance(provider.get("auth"), dict) else {}
+                provider_auth_type = str(provider_auth.get("type") or "bearer").strip().lower()
+                provider_model_map = provider.get("model_map") if isinstance(provider.get("model_map"), dict) else {}
+                upstream_model = str(
+                    provider_model_map.get(internal_model)
+                    or provider_model_map.get(internal_to_external_model.get(internal_model, internal_model))
+                    or internal_to_external_model.get(internal_model, internal_model)
+                )
 
                 try:
                     await enforce_sovereign_egress_or_raise_fn(
@@ -150,7 +158,7 @@ async def stream_llm_with_risk(
                     )
 
                     headers = build_provider_headers_fn(provider)
-                    if "Authorization" not in headers and provider_url == openai_url:
+                    if provider_auth_type == "bearer" and "Authorization" not in headers and provider_url == openai_url:
                         openai_key = await secret_provider.get_openai_key()
                         headers = build_upstream_llm_headers_or_raise_fn(api_key=openai_key, endpoint_url=provider_url)
 
@@ -158,8 +166,11 @@ async def stream_llm_with_risk(
                         llm_span.set_attribute("tenant.id", tenant_id)
                         llm_span.set_attribute("session.id", session_id)
                         llm_span.set_attribute("model.internal", internal_model)
+                        llm_span.set_attribute("model.upstream", upstream_model)
                         llm_span.set_attribute("upstream.url", provider_url)
                         llm_span.set_attribute("upstream.provider", provider_name)
+
+                        payload["model"] = upstream_model
 
                         async with httpx.AsyncClient(timeout=None) as client:
                             async with client.stream("POST", provider_url, headers=headers, json=payload) as resp:
@@ -370,6 +381,15 @@ async def stream_llm_with_risk(
                                     await send_alert_if_needed_fn(audit_payload, r=r)
                                 except Exception:
                                     pass
+
+                                if final_text:
+                                    if pii_mode == "redact":
+                                        final_stream_text = redact_pii_fn(final_text, pii_patterns)
+                                    else:
+                                        final_stream_text = final_text
+                                    tail_to_stream = final_stream_text[len(committed_prefix_streamed) :]
+                                    if tail_to_stream:
+                                        yield tail_to_stream.encode("utf-8")
 
                                 return
                 except asyncio.CancelledError:
