@@ -4,6 +4,7 @@ import json
 import os
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -40,43 +41,149 @@ def _default_model_name() -> str:
     ).strip()
 
 
+def _persona_storage_path() -> Path:
+    configured = str(os.getenv("APEX_UI_PERSONA_PATH", "")).strip()
+    if configured:
+        return Path(configured)
+    return Path(__file__).with_name("personas.json")
+
+
+def _build_persona_prompt(profile: Dict[str, str]) -> str:
+    role = str(profile.get("role") or "General assistant").strip()
+    tone = str(profile.get("tone") or "Clear and balanced").strip()
+    style = str(profile.get("style") or "Short, practical responses").strip()
+    goals = str(profile.get("goals") or "Help the user solve the task safely and effectively.").strip()
+    guardrails = str(profile.get("guardrails") or "Do not fabricate facts. Ask for clarification when context is missing.").strip()
+    system_instructions = str(profile.get("system_instructions") or "").strip()
+
+    sections = [
+        f"Role: {role}",
+        f"Tone: {tone}",
+        f"Style: {style}",
+        f"Primary goals: {goals}",
+        f"Behavior boundaries: {guardrails}",
+    ]
+    if system_instructions:
+        sections.append(f"Additional instructions: {system_instructions}")
+    return "\n".join(sections)
+
+
+def _sanitize_persona_profile(profile: Dict[str, Any]) -> Dict[str, str]:
+    normalized = {
+        "name": str(profile.get("name") or "Custom Persona").strip() or "Custom Persona",
+        "role": str(profile.get("role") or "General assistant").strip(),
+        "tone": str(profile.get("tone") or "Clear and balanced").strip(),
+        "style": str(profile.get("style") or "Short, practical responses").strip(),
+        "goals": str(profile.get("goals") or "Help the user solve the task safely and effectively.").strip(),
+        "guardrails": str(
+            profile.get("guardrails") or "Do not fabricate facts. Ask for clarification when context is missing."
+        ).strip(),
+        "system_instructions": str(profile.get("system_instructions") or "").strip(),
+    }
+
+    explicit_prompt = str(profile.get("prompt") or "").strip()
+    normalized["prompt"] = explicit_prompt if explicit_prompt else _build_persona_prompt(normalized)
+    return normalized
+
+
+def _save_persona_library(library: Dict[str, Dict[str, str]]) -> None:
+    path = _persona_storage_path()
+    payload = {"personas": library}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _load_persona_library() -> Dict[str, Dict[str, str]]:
+    path = _persona_storage_path()
+    if not path.exists():
+        return {}
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    if not isinstance(raw, dict):
+        return {}
+
+    loaded = raw.get("personas")
+    if not isinstance(loaded, dict):
+        return {}
+
+    sanitized: Dict[str, Dict[str, str]] = {}
+    for persona_id, profile in loaded.items():
+        if not isinstance(persona_id, str) or not isinstance(profile, dict):
+            continue
+        sanitized_id = persona_id.strip()
+        if not sanitized_id:
+            continue
+        sanitized[sanitized_id] = _sanitize_persona_profile(profile)
+    return sanitized
+
+
 def _default_persona_library() -> Dict[str, Dict[str, str]]:
     return {
         "neutral-operator": {
             "name": "Neutral Operator",
-            "prompt": (
-                "You are a precise, neutral assistant. "
-                "Respond clearly, avoid speculation, and prefer concise actionable guidance."
-            ),
+            "role": "Precise neutral assistant",
+            "tone": "Calm, objective, and direct",
+            "style": "Concise, structured recommendations",
+            "goals": "Give practical guidance with minimal ambiguity.",
+            "guardrails": "Avoid speculation. State uncertainty clearly.",
+            "system_instructions": "",
         },
         "warm-dad": {
             "name": "Warm Dad Mentor",
-            "prompt": (
-                "You are a calm, supportive fatherly mentor. "
-                "Be warm and practical, reinforce safety, and offer direct next steps."
-            ),
+            "role": "Supportive fatherly mentor",
+            "tone": "Warm, grounded, reassuring",
+            "style": "Encouraging language with concrete next steps",
+            "goals": "Help the user move forward with confidence and safety.",
+            "guardrails": "Never shame the user. Keep advice practical and safe.",
+            "system_instructions": "",
         },
         "socratic-coach": {
             "name": "Socratic Coach",
-            "prompt": (
-                "You are a thoughtful coach. "
-                "Ask one to three clarifying questions when useful, then propose a concrete plan."
-            ),
+            "role": "Reflective coach",
+            "tone": "Curious and constructive",
+            "style": "Ask up to three targeted questions, then propose a plan",
+            "goals": "Clarify intent before execution while keeping momentum.",
+            "guardrails": "Do not over-question. Transition quickly to action.",
+            "system_instructions": "",
         },
         "technical-architect": {
             "name": "Technical Architect",
-            "prompt": (
-                "You are a senior systems architect. "
-                "Prioritize correctness, tradeoffs, and implementation details over fluff."
-            ),
+            "role": "Senior systems architect",
+            "tone": "Analytical and pragmatic",
+            "style": "Tradeoff-first explanations with implementation specifics",
+            "goals": "Maximize correctness, reliability, and maintainability.",
+            "guardrails": "Call out risks and assumptions explicitly.",
+            "system_instructions": "",
         },
     }
 
 
 def _ensure_persona_state() -> None:
+    if not bool(st.session_state.get("persona_library_loaded", False)):
+        loaded = _load_persona_library()
+        if loaded:
+            st.session_state["persona_library"] = loaded
+        else:
+            default_library = {
+                persona_id: _sanitize_persona_profile(profile)
+                for persona_id, profile in _default_persona_library().items()
+            }
+            st.session_state["persona_library"] = default_library
+            _save_persona_library(default_library)
+        st.session_state["persona_library_loaded"] = True
+
     library = st.session_state.get("persona_library")
     if not isinstance(library, dict) or not library:
-        st.session_state["persona_library"] = _default_persona_library()
+        fallback = {
+            persona_id: _sanitize_persona_profile(profile)
+            for persona_id, profile in _default_persona_library().items()
+        }
+        st.session_state["persona_library"] = fallback
+        _save_persona_library(fallback)
 
     library = st.session_state["persona_library"]
     active = str(st.session_state.get("active_persona_id") or "").strip()
@@ -95,8 +202,14 @@ def _ensure_persona_state() -> None:
 
 def _sync_persona_editor_from_library(persona_id: str) -> None:
     library = st.session_state.get("persona_library") or {}
-    profile = library.get(persona_id) or {}
+    profile = _sanitize_persona_profile(library.get(persona_id) or {})
     st.session_state["persona_editor_name"] = str(profile.get("name") or "Custom Persona")
+    st.session_state["persona_editor_role"] = str(profile.get("role") or "")
+    st.session_state["persona_editor_tone"] = str(profile.get("tone") or "")
+    st.session_state["persona_editor_style"] = str(profile.get("style") or "")
+    st.session_state["persona_editor_goals"] = str(profile.get("goals") or "")
+    st.session_state["persona_editor_guardrails"] = str(profile.get("guardrails") or "")
+    st.session_state["persona_editor_system_instructions"] = str(profile.get("system_instructions") or "")
     st.session_state["persona_editor_prompt"] = str(profile.get("prompt") or "")
     st.session_state["persona_editor_loaded_id"] = persona_id
 
@@ -104,7 +217,7 @@ def _sync_persona_editor_from_library(persona_id: str) -> None:
 def _active_persona_profile() -> Dict[str, str]:
     library = st.session_state.get("persona_library") or {}
     active_id = str(st.session_state.get("active_persona_id") or "").strip()
-    profile = library.get(active_id) or {}
+    profile = _sanitize_persona_profile(library.get(active_id) or {})
     return {
         "id": active_id,
         "name": str(profile.get("name") or "Neutral Operator"),
@@ -848,7 +961,27 @@ def _render_header(cfg: SovereignConfig) -> None:
                 _sync_persona_editor_from_library(editor_id)
 
             st.text_input("Persona name", key="persona_editor_name")
-            st.text_area("System instructions", key="persona_editor_prompt", height=160)
+            persona_form_cols = st.columns([1, 1])
+            with persona_form_cols[0]:
+                st.text_input("Role", key="persona_editor_role")
+                st.text_input("Tone", key="persona_editor_tone")
+                st.text_input("Style", key="persona_editor_style")
+            with persona_form_cols[1]:
+                st.text_area("Primary goals", key="persona_editor_goals", height=110)
+                st.text_area("Behavior boundaries", key="persona_editor_guardrails", height=110)
+            st.text_area("Additional instructions", key="persona_editor_system_instructions", height=110)
+
+            generated_prompt = _build_persona_prompt(
+                {
+                    "role": str(st.session_state.get("persona_editor_role") or ""),
+                    "tone": str(st.session_state.get("persona_editor_tone") or ""),
+                    "style": str(st.session_state.get("persona_editor_style") or ""),
+                    "goals": str(st.session_state.get("persona_editor_goals") or ""),
+                    "guardrails": str(st.session_state.get("persona_editor_guardrails") or ""),
+                    "system_instructions": str(st.session_state.get("persona_editor_system_instructions") or ""),
+                }
+            )
+            st.text_area("Compiled system prompt preview", value=generated_prompt, height=170, disabled=True)
 
             persona_action_cols = st.columns([1.3, 1.3, 1.3, 1.3])
             with persona_action_cols[0]:
@@ -857,20 +990,29 @@ def _render_header(cfg: SovereignConfig) -> None:
                     st.rerun()
             with persona_action_cols[1]:
                 if st.button("Save changes", use_container_width=True, key="menu_save_persona"):
-                    name = str(st.session_state.get("persona_editor_name") or "").strip() or "Custom Persona"
-                    prompt = str(st.session_state.get("persona_editor_prompt") or "").strip()
-                    library[editor_id] = {"name": name, "prompt": prompt}
+                    profile = _sanitize_persona_profile(
+                        {
+                            "name": str(st.session_state.get("persona_editor_name") or "").strip() or "Custom Persona",
+                            "role": str(st.session_state.get("persona_editor_role") or ""),
+                            "tone": str(st.session_state.get("persona_editor_tone") or ""),
+                            "style": str(st.session_state.get("persona_editor_style") or ""),
+                            "goals": str(st.session_state.get("persona_editor_goals") or ""),
+                            "guardrails": str(st.session_state.get("persona_editor_guardrails") or ""),
+                            "system_instructions": str(st.session_state.get("persona_editor_system_instructions") or ""),
+                            "prompt": generated_prompt,
+                        }
+                    )
+                    library[editor_id] = profile
                     st.session_state["persona_library"] = library
+                    _save_persona_library(library)
                     if st.session_state.get("active_persona_id") == editor_id:
                         st.rerun()
             with persona_action_cols[2]:
                 if st.button("New persona", use_container_width=True, key="menu_new_persona"):
                     new_id = f"persona-{uuid.uuid4().hex[:8]}"
-                    library[new_id] = {
-                        "name": "New Persona",
-                        "prompt": "Describe tone, behavior, boundaries, and response style.",
-                    }
+                    library[new_id] = _sanitize_persona_profile({"name": "New Persona"})
                     st.session_state["persona_library"] = library
+                    _save_persona_library(library)
                     st.session_state["persona_editor_id"] = new_id
                     _sync_persona_editor_from_library(new_id)
                     st.rerun()
@@ -885,6 +1027,7 @@ def _render_header(cfg: SovereignConfig) -> None:
                     if editor_id in library and len(library) > 1:
                         del library[editor_id]
                         st.session_state["persona_library"] = library
+                        _save_persona_library(library)
                         replacement = next(iter(library.keys()))
                         if st.session_state.get("active_persona_id") == editor_id:
                             st.session_state["active_persona_id"] = replacement
