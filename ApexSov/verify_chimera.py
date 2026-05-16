@@ -12,7 +12,7 @@ from pathlib import Path
 
 def main() -> int:
     root = Path(__file__).parent
-    cmd = [sys.executable, "-m", "unittest", "tests.test_chimera_core"]
+    cmd = [sys.executable, "-m", "unittest", "discover", "-v", "-s", "tests", "-p", "test_*.py"]
     proc = subprocess.run(cmd, cwd=root)
     return proc.returncode
 
