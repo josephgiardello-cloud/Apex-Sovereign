@@ -20,6 +20,8 @@ class SovereignConfig:
     bearer_token: str
     model: str
     timeout_seconds: float
+    persona_name: str
+    persona_prompt: str
 
 
 def _default_base_url() -> str:
@@ -36,6 +38,93 @@ def _default_model_name() -> str:
         or os.getenv("DADBOT_SOVEREIGN_MODEL")
         or "apex-qwen"
     ).strip()
+
+
+def _default_persona_library() -> Dict[str, Dict[str, str]]:
+    return {
+        "neutral-operator": {
+            "name": "Neutral Operator",
+            "prompt": (
+                "You are a precise, neutral assistant. "
+                "Respond clearly, avoid speculation, and prefer concise actionable guidance."
+            ),
+        },
+        "warm-dad": {
+            "name": "Warm Dad Mentor",
+            "prompt": (
+                "You are a calm, supportive fatherly mentor. "
+                "Be warm and practical, reinforce safety, and offer direct next steps."
+            ),
+        },
+        "socratic-coach": {
+            "name": "Socratic Coach",
+            "prompt": (
+                "You are a thoughtful coach. "
+                "Ask one to three clarifying questions when useful, then propose a concrete plan."
+            ),
+        },
+        "technical-architect": {
+            "name": "Technical Architect",
+            "prompt": (
+                "You are a senior systems architect. "
+                "Prioritize correctness, tradeoffs, and implementation details over fluff."
+            ),
+        },
+    }
+
+
+def _ensure_persona_state() -> None:
+    library = st.session_state.get("persona_library")
+    if not isinstance(library, dict) or not library:
+        st.session_state["persona_library"] = _default_persona_library()
+
+    library = st.session_state["persona_library"]
+    active = str(st.session_state.get("active_persona_id") or "").strip()
+    if active not in library:
+        st.session_state["active_persona_id"] = next(iter(library.keys()))
+
+    editor_id = str(st.session_state.get("persona_editor_id") or "").strip()
+    if editor_id not in library:
+        st.session_state["persona_editor_id"] = st.session_state["active_persona_id"]
+        editor_id = st.session_state["persona_editor_id"]
+
+    loaded = str(st.session_state.get("persona_editor_loaded_id") or "").strip()
+    if loaded != editor_id:
+        _sync_persona_editor_from_library(editor_id)
+
+
+def _sync_persona_editor_from_library(persona_id: str) -> None:
+    library = st.session_state.get("persona_library") or {}
+    profile = library.get(persona_id) or {}
+    st.session_state["persona_editor_name"] = str(profile.get("name") or "Custom Persona")
+    st.session_state["persona_editor_prompt"] = str(profile.get("prompt") or "")
+    st.session_state["persona_editor_loaded_id"] = persona_id
+
+
+def _active_persona_profile() -> Dict[str, str]:
+    library = st.session_state.get("persona_library") or {}
+    active_id = str(st.session_state.get("active_persona_id") or "").strip()
+    profile = library.get(active_id) or {}
+    return {
+        "id": active_id,
+        "name": str(profile.get("name") or "Neutral Operator"),
+        "prompt": str(profile.get("prompt") or ""),
+    }
+
+
+def _compose_request_messages(messages: List[Dict[str, str]], persona_prompt: str) -> List[Dict[str, str]]:
+    request_messages: List[Dict[str, str]] = []
+    system_prompt = str(persona_prompt or "").strip()
+    if system_prompt:
+        request_messages.append({"role": "system", "content": system_prompt})
+
+    for msg in messages:
+        role = str(msg.get("role") or "").strip()
+        content = str(msg.get("content") or "")
+        if role in {"user", "assistant"} and content:
+            request_messages.append({"role": role, "content": content})
+
+    return request_messages
 
 
 def _inject_design_system() -> None:
@@ -668,12 +757,15 @@ def _status_pill_class(path: str, code: Optional[int]) -> str:
 
 
 def _render_sidebar() -> SovereignConfig:
+    _ensure_persona_state()
     _render_avatar_holder()
     st.sidebar.markdown("---")
     tenant_id = st.sidebar.text_input("Tenant", value=_default_tenant_id())
     default_session = st.session_state.setdefault("session_id", f"session-{uuid.uuid4().hex[:8]}")
     session_id = st.sidebar.text_input("Session ID", value=default_session)
     model = st.sidebar.text_input("Model", value=_default_model_name())
+    active_persona = _active_persona_profile()
+    st.sidebar.caption(f"Active persona: {active_persona['name']}")
 
     with st.sidebar.expander("Connection", expanded=False):
         base_url = st.text_input("Base URL", value=_default_base_url())
@@ -708,6 +800,8 @@ def _render_sidebar() -> SovereignConfig:
         bearer_token=bearer_token,
         model=model,
         timeout_seconds=float(timeout_seconds),
+        persona_name=active_persona["name"],
+        persona_prompt=active_persona["prompt"],
     )
 
 
@@ -740,6 +834,64 @@ def _render_header(cfg: SovereignConfig) -> None:
                 if st.button("Close menu", use_container_width=True, key="menu_close_panel"):
                     st.session_state["show_top_menu"] = False
                     st.rerun()
+
+            st.markdown("<p class='menu-note'>Persona Studio</p>", unsafe_allow_html=True)
+            library = st.session_state.get("persona_library") or {}
+            persona_ids = list(library.keys())
+            editor_id = st.selectbox(
+                "Persona profile",
+                options=persona_ids,
+                format_func=lambda persona_id: str((library.get(persona_id) or {}).get("name") or persona_id),
+                key="persona_editor_id",
+            )
+            if str(st.session_state.get("persona_editor_loaded_id") or "") != editor_id:
+                _sync_persona_editor_from_library(editor_id)
+
+            st.text_input("Persona name", key="persona_editor_name")
+            st.text_area("System instructions", key="persona_editor_prompt", height=160)
+
+            persona_action_cols = st.columns([1.3, 1.3, 1.3, 1.3])
+            with persona_action_cols[0]:
+                if st.button("Use persona", use_container_width=True, key="menu_use_persona"):
+                    st.session_state["active_persona_id"] = editor_id
+                    st.rerun()
+            with persona_action_cols[1]:
+                if st.button("Save changes", use_container_width=True, key="menu_save_persona"):
+                    name = str(st.session_state.get("persona_editor_name") or "").strip() or "Custom Persona"
+                    prompt = str(st.session_state.get("persona_editor_prompt") or "").strip()
+                    library[editor_id] = {"name": name, "prompt": prompt}
+                    st.session_state["persona_library"] = library
+                    if st.session_state.get("active_persona_id") == editor_id:
+                        st.rerun()
+            with persona_action_cols[2]:
+                if st.button("New persona", use_container_width=True, key="menu_new_persona"):
+                    new_id = f"persona-{uuid.uuid4().hex[:8]}"
+                    library[new_id] = {
+                        "name": "New Persona",
+                        "prompt": "Describe tone, behavior, boundaries, and response style.",
+                    }
+                    st.session_state["persona_library"] = library
+                    st.session_state["persona_editor_id"] = new_id
+                    _sync_persona_editor_from_library(new_id)
+                    st.rerun()
+            with persona_action_cols[3]:
+                disable_delete = len(persona_ids) <= 1
+                if st.button(
+                    "Delete persona",
+                    use_container_width=True,
+                    key="menu_delete_persona",
+                    disabled=disable_delete,
+                ):
+                    if editor_id in library and len(library) > 1:
+                        del library[editor_id]
+                        st.session_state["persona_library"] = library
+                        replacement = next(iter(library.keys()))
+                        if st.session_state.get("active_persona_id") == editor_id:
+                            st.session_state["active_persona_id"] = replacement
+                        st.session_state["persona_editor_id"] = replacement
+                        _sync_persona_editor_from_library(replacement)
+                        st.rerun()
+
             show_runtime = st.checkbox("Show runtime status", value=False, key="menu_show_runtime")
             if show_runtime:
                 st.markdown(
@@ -747,6 +899,7 @@ def _render_header(cfg: SovereignConfig) -> None:
                         f"<span class='chip'>tenant:{cfg.tenant_id}</span>"
                         f"<span class='chip'>session:{cfg.session_id}</span>"
                         f"<span class='chip'>model:{cfg.model}</span>"
+                        f"<span class='chip'>persona:{cfg.persona_name}</span>"
                     ),
                     unsafe_allow_html=True,
                 )
@@ -785,7 +938,8 @@ def _render_chat(cfg: SovereignConfig) -> None:
 
     with st.chat_message("assistant"):
         with st.spinner("Streaming through Sovereign..."):
-            ok, text, status = _call_stream(cfg, messages)
+            request_messages = _compose_request_messages(messages, cfg.persona_prompt)
+            ok, text, status = _call_stream(cfg, request_messages)
 
         if ok:
             structured_error = _extract_structured_error(text)
@@ -811,6 +965,7 @@ def _render_transport_panel(cfg: SovereignConfig) -> None:
 def main() -> None:
     st.set_page_config(page_title="Sovereign Chat Console", layout="wide")
     _inject_design_system()
+    _ensure_persona_state()
     cfg = _render_sidebar()
     _render_header(cfg)
     _inject_deploy_row_actions()
