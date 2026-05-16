@@ -53,6 +53,7 @@ def _build_persona_prompt(profile: Dict[str, str]) -> str:
     tone = str(profile.get("tone") or "Clear and balanced").strip()
     style = str(profile.get("style") or "Short, practical responses").strip()
     goals = str(profile.get("goals") or "Help the user solve the task safely and effectively.").strip()
+    domain_facts = str(profile.get("domain_facts") or "").strip()
     guardrails = str(profile.get("guardrails") or "Do not fabricate facts. Ask for clarification when context is missing.").strip()
     system_instructions = str(profile.get("system_instructions") or "").strip()
 
@@ -61,6 +62,7 @@ def _build_persona_prompt(profile: Dict[str, str]) -> str:
         f"Tone: {tone}",
         f"Style: {style}",
         f"Primary goals: {goals}",
+        f"Operating facts and context: {domain_facts or 'Use only user-provided context and clearly mark uncertainty.'}",
         f"Behavior boundaries: {guardrails}",
     ]
     if system_instructions:
@@ -75,6 +77,7 @@ def _sanitize_persona_profile(profile: Dict[str, Any]) -> Dict[str, str]:
         "tone": str(profile.get("tone") or "Clear and balanced").strip(),
         "style": str(profile.get("style") or "Short, practical responses").strip(),
         "goals": str(profile.get("goals") or "Help the user solve the task safely and effectively.").strip(),
+        "domain_facts": str(profile.get("domain_facts") or "").strip(),
         "guardrails": str(
             profile.get("guardrails") or "Do not fabricate facts. Ask for clarification when context is missing."
         ).strip(),
@@ -129,6 +132,7 @@ def _default_persona_library() -> Dict[str, Dict[str, str]]:
             "tone": "Calm, objective, and direct",
             "style": "Concise, structured recommendations",
             "goals": "Give practical guidance with minimal ambiguity.",
+            "domain_facts": "General-purpose assistant for governance and engineering requests.",
             "guardrails": "Avoid speculation. State uncertainty clearly.",
             "system_instructions": "",
         },
@@ -138,6 +142,7 @@ def _default_persona_library() -> Dict[str, Dict[str, str]]:
             "tone": "Warm, grounded, reassuring",
             "style": "Encouraging language with concrete next steps",
             "goals": "Help the user move forward with confidence and safety.",
+            "domain_facts": "Family and personal productivity support context.",
             "guardrails": "Never shame the user. Keep advice practical and safe.",
             "system_instructions": "",
         },
@@ -147,6 +152,7 @@ def _default_persona_library() -> Dict[str, Dict[str, str]]:
             "tone": "Curious and constructive",
             "style": "Ask up to three targeted questions, then propose a plan",
             "goals": "Clarify intent before execution while keeping momentum.",
+            "domain_facts": "Discovery-first coaching context for ambiguous tasks.",
             "guardrails": "Do not over-question. Transition quickly to action.",
             "system_instructions": "",
         },
@@ -156,10 +162,132 @@ def _default_persona_library() -> Dict[str, Dict[str, str]]:
             "tone": "Analytical and pragmatic",
             "style": "Tradeoff-first explanations with implementation specifics",
             "goals": "Maximize correctness, reliability, and maintainability.",
+            "domain_facts": "Systems design and implementation context.",
             "guardrails": "Call out risks and assumptions explicitly.",
             "system_instructions": "",
         },
     }
+
+
+def _persona_builder_questions() -> List[Dict[str, str]]:
+    return [
+        {
+            "key": "name",
+            "label": "Persona name",
+            "question": "What should we call this persona?",
+            "fallback": "Custom Persona",
+        },
+        {
+            "key": "role",
+            "label": "Core role",
+            "question": "What is this persona's core role or job?",
+            "fallback": "General assistant",
+        },
+        {
+            "key": "tone",
+            "label": "Tone",
+            "question": "What tone should it use? (for example: direct, warm, tactical)",
+            "fallback": "Clear and balanced",
+        },
+        {
+            "key": "style",
+            "label": "Response style",
+            "question": "How should it format responses? (for example: bullet points, step-by-step, concise)",
+            "fallback": "Short, practical responses",
+        },
+        {
+            "key": "goals",
+            "label": "Primary goals",
+            "question": "What outcomes should this persona optimize for?",
+            "fallback": "Help the user solve the task safely and effectively.",
+        },
+        {
+            "key": "domain_facts",
+            "label": "Facts and context",
+            "question": "What facts, constraints, or domain context should it always operate within?",
+            "fallback": "Use only user-provided context and clearly mark uncertainty.",
+        },
+        {
+            "key": "guardrails",
+            "label": "Guardrails",
+            "question": "Any strict boundaries or things it must avoid?",
+            "fallback": "Do not fabricate facts. Ask for clarification when context is missing.",
+        },
+        {
+            "key": "system_instructions",
+            "label": "Extra instructions",
+            "question": "Any additional instructions? (You can say 'none')",
+            "fallback": "",
+        },
+    ]
+
+
+def _start_persona_builder() -> None:
+    st.session_state["persona_builder_active"] = True
+    st.session_state["persona_builder_step"] = 0
+    st.session_state["persona_builder_answers"] = {}
+
+    messages: List[Dict[str, str]] = st.session_state.setdefault(
+        "messages",
+        [{"role": "assistant", "content": "Console online. Send a prompt when ready."}],
+    )
+    messages.append(
+        {
+            "role": "assistant",
+            "content": (
+                "Persona Builder is now active. I will ask focused questions and then create a new persona for you. "
+                "Reply naturally; short answers are fine."
+            ),
+        }
+    )
+    questions = _persona_builder_questions()
+    if questions:
+        messages.append({"role": "assistant", "content": questions[0]["question"]})
+
+
+def _stop_persona_builder() -> None:
+    st.session_state["persona_builder_active"] = False
+    st.session_state["persona_builder_step"] = 0
+    st.session_state["persona_builder_answers"] = {}
+
+
+def _handle_persona_builder_turn(user_text: str) -> str:
+    questions = _persona_builder_questions()
+    step = int(st.session_state.get("persona_builder_step", 0))
+    answers = dict(st.session_state.get("persona_builder_answers") or {})
+
+    if step >= len(questions):
+        _stop_persona_builder()
+        return "Persona Builder was already complete. It has been reset."
+
+    question = questions[step]
+    answer = user_text.strip() or question.get("fallback", "")
+    if answer.lower() == "none" and question["key"] == "system_instructions":
+        answer = ""
+    answers[question["key"]] = answer
+    st.session_state["persona_builder_answers"] = answers
+
+    next_step = step + 1
+    st.session_state["persona_builder_step"] = next_step
+
+    if next_step < len(questions):
+        return questions[next_step]["question"]
+
+    profile = _sanitize_persona_profile(answers)
+    persona_id = f"persona-{uuid.uuid4().hex[:8]}"
+    library = st.session_state.get("persona_library") or {}
+    library[persona_id] = profile
+    st.session_state["persona_library"] = library
+    st.session_state["active_persona_id"] = persona_id
+    st.session_state["persona_editor_id"] = persona_id
+    _sync_persona_editor_from_library(persona_id)
+    _save_persona_library(library)
+    _stop_persona_builder()
+
+    return (
+        f"Persona created: **{profile['name']}** and set as active. "
+        "You can refine it in Persona Studio or start chatting with it now."
+    )
 
 
 def _ensure_persona_state() -> None:
@@ -208,6 +336,7 @@ def _sync_persona_editor_from_library(persona_id: str) -> None:
     st.session_state["persona_editor_tone"] = str(profile.get("tone") or "")
     st.session_state["persona_editor_style"] = str(profile.get("style") or "")
     st.session_state["persona_editor_goals"] = str(profile.get("goals") or "")
+    st.session_state["persona_editor_domain_facts"] = str(profile.get("domain_facts") or "")
     st.session_state["persona_editor_guardrails"] = str(profile.get("guardrails") or "")
     st.session_state["persona_editor_system_instructions"] = str(profile.get("system_instructions") or "")
     st.session_state["persona_editor_prompt"] = str(profile.get("prompt") or "")
@@ -968,6 +1097,7 @@ def _render_header(cfg: SovereignConfig) -> None:
                 st.text_input("Style", key="persona_editor_style")
             with persona_form_cols[1]:
                 st.text_area("Primary goals", key="persona_editor_goals", height=110)
+                st.text_area("Facts and context", key="persona_editor_domain_facts", height=110)
                 st.text_area("Behavior boundaries", key="persona_editor_guardrails", height=110)
             st.text_area("Additional instructions", key="persona_editor_system_instructions", height=110)
 
@@ -977,13 +1107,14 @@ def _render_header(cfg: SovereignConfig) -> None:
                     "tone": str(st.session_state.get("persona_editor_tone") or ""),
                     "style": str(st.session_state.get("persona_editor_style") or ""),
                     "goals": str(st.session_state.get("persona_editor_goals") or ""),
+                    "domain_facts": str(st.session_state.get("persona_editor_domain_facts") or ""),
                     "guardrails": str(st.session_state.get("persona_editor_guardrails") or ""),
                     "system_instructions": str(st.session_state.get("persona_editor_system_instructions") or ""),
                 }
             )
             st.text_area("Compiled system prompt preview", value=generated_prompt, height=170, disabled=True)
 
-            persona_action_cols = st.columns([1.3, 1.3, 1.3, 1.3])
+            persona_action_cols = st.columns([1.3, 1.3, 1.3, 1.3, 1.6])
             with persona_action_cols[0]:
                 if st.button("Use persona", use_container_width=True, key="menu_use_persona"):
                     st.session_state["active_persona_id"] = editor_id
@@ -997,6 +1128,7 @@ def _render_header(cfg: SovereignConfig) -> None:
                             "tone": str(st.session_state.get("persona_editor_tone") or ""),
                             "style": str(st.session_state.get("persona_editor_style") or ""),
                             "goals": str(st.session_state.get("persona_editor_goals") or ""),
+                            "domain_facts": str(st.session_state.get("persona_editor_domain_facts") or ""),
                             "guardrails": str(st.session_state.get("persona_editor_guardrails") or ""),
                             "system_instructions": str(st.session_state.get("persona_editor_system_instructions") or ""),
                             "prompt": generated_prompt,
@@ -1034,6 +1166,11 @@ def _render_header(cfg: SovereignConfig) -> None:
                         st.session_state["persona_editor_id"] = replacement
                         _sync_persona_editor_from_library(replacement)
                         st.rerun()
+            with persona_action_cols[4]:
+                if st.button("Build persona in chat", use_container_width=True, key="menu_build_persona_chat"):
+                    _start_persona_builder()
+                    st.session_state["show_top_menu"] = False
+                    st.rerun()
 
             show_runtime = st.checkbox("Show runtime status", value=False, key="menu_show_runtime")
             if show_runtime:
@@ -1071,7 +1208,12 @@ def _render_chat(cfg: SovereignConfig) -> None:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    prompt = st.chat_input("Send a governed prompt...")
+    builder_active = bool(st.session_state.get("persona_builder_active", False))
+    prompt = st.chat_input(
+        "Answer the persona builder question..."
+        if builder_active
+        else "Send a governed prompt..."
+    )
     if not prompt:
         return
 
@@ -1080,22 +1222,27 @@ def _render_chat(cfg: SovereignConfig) -> None:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Streaming through Sovereign..."):
-            request_messages = _compose_request_messages(messages, cfg.persona_prompt)
-            ok, text, status = _call_stream(cfg, request_messages)
-
-        if ok:
-            structured_error = _extract_structured_error(text)
-            if structured_error is not None:
-                st.warning("Sovereign returned a structured stream error payload.")
-                st.code(json.dumps(structured_error, indent=2), language="json")
-                messages.append({"role": "assistant", "content": f"Error payload:\n```json\n{json.dumps(structured_error, indent=2)}\n```"})
-            else:
-                st.markdown(text)
-                messages.append({"role": "assistant", "content": text})
+        if builder_active:
+            reply = _handle_persona_builder_turn(prompt)
+            st.markdown(reply)
+            messages.append({"role": "assistant", "content": reply})
         else:
-            st.error(f"Sovereign request failed (status={status or 'n/a'})")
-            st.code(text or "<empty error>")
+            with st.spinner("Streaming through Sovereign..."):
+                request_messages = _compose_request_messages(messages, cfg.persona_prompt)
+                ok, text, status = _call_stream(cfg, request_messages)
+
+            if ok:
+                structured_error = _extract_structured_error(text)
+                if structured_error is not None:
+                    st.warning("Sovereign returned a structured stream error payload.")
+                    st.code(json.dumps(structured_error, indent=2), language="json")
+                    messages.append({"role": "assistant", "content": f"Error payload:\n```json\n{json.dumps(structured_error, indent=2)}\n```"})
+                else:
+                    st.markdown(text)
+                    messages.append({"role": "assistant", "content": text})
+            else:
+                st.error(f"Sovereign request failed (status={status or 'n/a'})")
+                st.code(text or "<empty error>")
 
 
 def _render_transport_panel(cfg: SovereignConfig) -> None:

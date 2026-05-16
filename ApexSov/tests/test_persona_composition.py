@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from dadbot_sovereign_ui import _build_persona_prompt, _compose_request_messages, _sanitize_persona_profile
+from dadbot_sovereign_ui import (
+    _build_persona_prompt,
+    _compose_request_messages,
+    _persona_builder_questions,
+    _sanitize_persona_profile,
+)
 
 
 class PersonaCompositionTests(unittest.TestCase):
@@ -13,6 +18,7 @@ class PersonaCompositionTests(unittest.TestCase):
                 "tone": "Steady",
                 "style": "Short bullets",
                 "goals": "Stabilize systems and keep operators informed",
+                "domain_facts": "Operate in regulated finance workflows",
                 "guardrails": "Avoid guessing root cause",
                 "system_instructions": "Always provide rollback criteria.",
             }
@@ -22,6 +28,7 @@ class PersonaCompositionTests(unittest.TestCase):
         self.assertIn("Tone: Steady", prompt)
         self.assertIn("Style: Short bullets", prompt)
         self.assertIn("Primary goals: Stabilize systems and keep operators informed", prompt)
+        self.assertIn("Operating facts and context: Operate in regulated finance workflows", prompt)
         self.assertIn("Behavior boundaries: Avoid guessing root cause", prompt)
         self.assertIn("Additional instructions: Always provide rollback criteria.", prompt)
 
@@ -30,7 +37,26 @@ class PersonaCompositionTests(unittest.TestCase):
 
         self.assertEqual(profile["name"], "Ops Agent")
         self.assertEqual(profile["role"], "Ops responder")
+        self.assertEqual(profile["domain_facts"], "")
         self.assertTrue(profile["prompt"].startswith("Role: Ops responder"))
+
+    def test_persona_builder_questions_cover_required_fields(self) -> None:
+        questions = _persona_builder_questions()
+        keys = [item["key"] for item in questions]
+
+        self.assertEqual(
+            keys,
+            [
+                "name",
+                "role",
+                "tone",
+                "style",
+                "goals",
+                "domain_facts",
+                "guardrails",
+                "system_instructions",
+            ],
+        )
 
     def test_injects_system_prompt_before_chat_history(self) -> None:
         messages = [
