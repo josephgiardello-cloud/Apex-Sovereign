@@ -25,6 +25,47 @@ class SovereignConfig:
     persona_prompt: str
 
 
+def _maybe_generate_avatar_response(text: str, cfg: SovereignConfig) -> Optional[str]:
+    source = str(st.session_state.get("avatar_source") or "")
+    enabled = bool(st.session_state.get("avatar_enabled", False))
+    auto_generate = bool(st.session_state.get("avatar_auto_generate", False))
+    if not enabled or source != "Generated (TTS + LivePortrait)" or not auto_generate:
+        return None
+
+    portrait_image = str(st.session_state.get("avatar_portrait_image") or "").strip()
+    workflow_path = str(st.session_state.get("avatar_workflow_path") or "").strip()
+    comfyui_url = str(st.session_state.get("avatar_comfyui_url") or "http://127.0.0.1:8188").strip()
+    tts_backend = str(st.session_state.get("avatar_tts_backend") or "piper").strip()
+    piper_exe = str(st.session_state.get("avatar_piper_exe") or "").strip()
+    piper_model = str(st.session_state.get("avatar_piper_model") or "").strip()
+
+    if not portrait_image:
+        return "Avatar generation skipped: set a portrait image path in sidebar settings."
+
+    try:
+        from avatar_runtime import AvatarEngine
+
+        engine = AvatarEngine(
+            apex_url=cfg.base_url,
+            comfyui_url=comfyui_url,
+            portrait_image=portrait_image,
+            workflow_path=workflow_path,
+            output_dir="avatar_outputs",
+            tts_backend=tts_backend,
+            piper_exe=piper_exe,
+            piper_model=piper_model,
+        )
+        result = engine.create_avatar_clip(text)
+        st.session_state["avatar_last_audio"] = str(result.get("audio_path") or "")
+        st.session_state["avatar_last_video"] = str(result.get("video_url") or "")
+        st.session_state["avatar_last_error"] = ""
+        return None
+    except Exception as exc:
+        error_text = f"Avatar generation failed: {exc}"
+        st.session_state["avatar_last_error"] = error_text
+        return error_text
+
+
 def _default_base_url() -> str:
     return str(os.getenv("DADBOT_SOVEREIGN_BASE_URL", "http://127.0.0.1:8000")).strip()
 
@@ -750,7 +791,7 @@ def _render_avatar_holder() -> None:
     enabled = st.sidebar.checkbox("Enable live avatar", value=True, key="avatar_enabled")
     source = st.sidebar.selectbox(
         "Avatar source",
-        options=["Placeholder", "WebRTC Embed", "Stream URL", "Image URL"],
+        options=["Placeholder", "WebRTC Embed", "Stream URL", "Image URL", "Generated (TTS + LivePortrait)"],
         index=0,
         key="avatar_source",
     )
@@ -804,6 +845,39 @@ def _render_avatar_holder() -> None:
             st.sidebar.image(image_url.strip(), use_container_width=True)
         else:
             st.sidebar.caption("Add an image URL for an avatar portrait.")
+    elif source == "Generated (TTS + LivePortrait)":
+        st.sidebar.caption("Pipeline: Apex response -> TTS -> LivePortrait -> video")
+        st.sidebar.checkbox("Auto-generate on assistant replies", value=False, key="avatar_auto_generate")
+        st.sidebar.text_input("ComfyUI URL", value="http://127.0.0.1:8188", key="avatar_comfyui_url")
+        st.sidebar.text_input(
+            "Workflow JSON path",
+            value="workflows/liveportrait_audio_template.json",
+            key="avatar_workflow_path",
+        )
+        st.sidebar.text_input("Portrait image path", value="", key="avatar_portrait_image")
+        st.sidebar.selectbox(
+            "TTS backend",
+            options=["piper", "stub"],
+            index=0,
+            key="avatar_tts_backend",
+            help="Use 'stub' for testing without Piper installed.",
+        )
+        st.sidebar.text_input("Piper executable", value="", key="avatar_piper_exe")
+        st.sidebar.text_input("Piper model", value="", key="avatar_piper_model")
+
+        last_video = str(st.session_state.get("avatar_last_video") or "").strip()
+        last_audio = str(st.session_state.get("avatar_last_audio") or "").strip()
+        last_error = str(st.session_state.get("avatar_last_error") or "").strip()
+        if last_error:
+            st.sidebar.error(last_error)
+        if last_video:
+            st.sidebar.caption("Latest generated avatar clip")
+            st.sidebar.video(last_video)
+        if last_audio:
+            st.sidebar.caption("Latest generated audio")
+            st.sidebar.audio(last_audio)
+        if not (last_video or last_audio or last_error):
+            st.sidebar.caption("No generated clip yet. Ask the assistant a question to generate one.")
     else:
         st.sidebar.caption("Placeholder mode active. Switch source to stream or image when ready.")
 
@@ -1240,6 +1314,9 @@ def _render_chat(cfg: SovereignConfig) -> None:
                 else:
                     st.markdown(text)
                     messages.append({"role": "assistant", "content": text})
+                    avatar_error = _maybe_generate_avatar_response(text, cfg)
+                    if avatar_error:
+                        st.info(avatar_error)
             else:
                 st.error(f"Sovereign request failed (status={status or 'n/a'})")
                 st.code(text or "<empty error>")
